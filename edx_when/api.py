@@ -439,6 +439,10 @@ def set_date_for_block(
 
         if needs_save:
             existing_date.save()
+
+        # Regenerate cached dates.
+        get_dates_for_course(course_id, user=user, use_cached=False)
+
         return existing_date.id
 
 

@@ -590,6 +590,7 @@ def update_or_create_assignments_due_dates(course_key, assignments: list[Assignm
     Returns:
         None
     """
+    course_key = _ensure_key(CourseKey, course_key)
     course_key_str = str(course_key)
     with transaction.atomic():
         for assignment in assignments:
@@ -610,9 +611,9 @@ def update_or_create_assignments_due_dates(course_key, assignments: list[Assignm
                 course_id=course_key,
                 location=assignment.block_key,
                 field='due',
-                block_type=assignment.assignment_type,
                 defaults={
                     'policy': models.DatePolicy.objects.get_or_create(abs_date=assignment.date)[0],
+                    'block_type': assignment.block_key.block_type,
                     'assignment_title': assignment.title,
                     'course_name': course_key.course,
                     'subsection_name': assignment.subsection_name,

@@ -401,6 +401,19 @@ def get_overrides_for_course(course_id):
     return dates
 
 
+def _set_content_date_policy(date_kwargs, content_date):
+    """
+    Assign a DatePolicy matching ``date_kwargs`` to ``content_date``.
+
+    Reuses an existing DatePolicy with the same values when present, otherwise creates one.
+    """
+    existing_policies = list(models.DatePolicy.objects.filter(**date_kwargs).order_by('id'))
+    if existing_policies:
+        content_date.policy = existing_policies[0]
+    else:
+        content_date.policy = models.DatePolicy.objects.create(**date_kwargs)
+
+
 def set_date_for_block(
         course_id, block_id, field, date_or_timedelta,
         user=None, reason='', actor=None
@@ -425,14 +438,6 @@ def set_date_for_block(
         date_kwargs = {'rel_date': date_or_timedelta}
     else:
         date_kwargs = {'abs_date': date_or_timedelta}
-
-    def _set_content_date_policy(date_kwargs, existing_content_date):
-        # Race conditions were creating multiple DatePolicies w/ the same values. Handle that case.
-        existing_policies = list(models.DatePolicy.objects.filter(**date_kwargs).order_by('id'))
-        if existing_policies:
-            existing_content_date.policy = existing_policies[0]
-        else:
-            existing_content_date.policy = models.DatePolicy.objects.create(**date_kwargs)
 
     with transaction.atomic(savepoint=False):  # this is frequently called in a loop, let's avoid the savepoints
         try:
@@ -552,13 +557,12 @@ def get_schedules_with_due_date(course_id, assignment_date):
 @dataclass
 class Assignment:
     """
-    Represents an assignment with a title, date, block key, assignment type, and optional subsection name.
+    Represents an assignment with a title, due date, block key, and optional subsection name.
     """
 
     title: str
     date: datetime | None
     block_key: UsageKey
-    assignment_type: str
     subsection_name: str = ''
 
     def __post_init__(self):
@@ -580,6 +584,11 @@ def update_or_create_assignments_due_dates(course_key, assignments: list[Assignm
     a new one is created. All operations are performed inside a single database
     transaction.
 
+    Row identity is (course_id, location, field='due'); ``block_type`` stores the
+    structural XBlock type (e.g. 'sequential') and is not part of the lookup. The
+    DatePolicy is resolved via `_set_content_date_policy` so concurrent calls
+    do not create duplicate DatePolicy rows.
+
     Arguments:
         course_key: CourseKey or string representation of the course.
         assignments: List of Assignment instances. Assignments with missing date or
@@ -591,34 +600,40 @@ def update_or_create_assignments_due_dates(course_key, assignments: list[Assignm
         None
     """
     course_key = _ensure_key(CourseKey, course_key)
-    course_key_str = str(course_key)
     with transaction.atomic():
         for assignment in assignments:
             log.info(
                 "Updating assignment '%s' with due date '%s' for course %s",
                 assignment.title,
                 assignment.date,
-                course_key_str
+                course_key
             )
             if not all((assignment.date, assignment.title)):
                 log.warning(
                     "Skipping assignment '%s' for course %s because it has no date or title",
                     assignment,
-                    course_key_str
+                    course_key
                 )
                 continue
-            models.ContentDate.objects.update_or_create(
-                course_id=course_key,
-                location=assignment.block_key,
-                field='due',
-                defaults={
-                    'policy': models.DatePolicy.objects.get_or_create(abs_date=assignment.date)[0],
-                    'block_type': assignment.block_key.block_type,
-                    'assignment_title': assignment.title,
-                    'course_name': course_key.course,
-                    'subsection_name': assignment.subsection_name,
-                }
-            )
+            try:
+                content_date = models.ContentDate.objects.select_related('policy').get(
+                    course_id=course_key,
+                    location=assignment.block_key,
+                    field='due',
+                )
+            except models.ContentDate.DoesNotExist:
+                content_date = models.ContentDate(
+                    course_id=course_key,
+                    location=assignment.block_key,
+                    field='due',
+                )
+            _set_content_date_policy({'abs_date': assignment.date}, content_date)
+            content_date.block_type = assignment.block_key.block_type
+            content_date.assignment_title = assignment.title
+            content_date.course_name = course_key.course
+            content_date.subsection_name = assignment.subsection_name
+            content_date.active = True
+            content_date.save()
 
 
 class BaseWhenException(Exception):

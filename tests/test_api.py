@@ -751,19 +751,13 @@ class ApiWaffleTests(TestCase):
         assert not api._are_relative_dates_enabled()  # pylint: disable=protected-access
 
 
-class TestUpdateAssignmentDatesForCourse(TestCase):
+class TestUpdateOrCreateAssignmentsDueDates(TestCase):
     """
-    Tests for the update_assignment_dates_for_course task.
+    Tests for the update_or_create_assignments_due_dates API function.
     """
 
     def setUp(self):
         self.course_key = CourseKey.from_string('course-v1:edX+DemoX+Demo_Course')
-        self.course_key_str = str(self.course_key)
-        self.staff_user = User.objects.create_user(
-            username='staff_user',
-            email='staff@example.com',
-            is_staff=True
-        )
         self.block_key = UsageKey.from_string(
             'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test1'
         )
@@ -773,7 +767,6 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
                 title='Test Assignment',
                 date=self.due_date,
                 block_key=self.block_key,
-                assignment_type='Homework',
                 subsection_name='Test Subsection',
             )
         ]
@@ -790,8 +783,10 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
         )
         self.assertEqual(content_date.assignment_title, 'Test Assignment')
         self.assertEqual(content_date.subsection_name, 'Test Subsection')
+        # block_type stores the structural XBlock type, taken from block_key.
         self.assertEqual(content_date.block_type, 'sequential')
         self.assertEqual(content_date.policy.abs_date, self.due_date)
+        self.assertTrue(content_date.active)
 
     def test_update_assignment_dates_existing_records(self):
         """
@@ -804,7 +799,7 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
             course_id=self.course_key,
             location=self.block_key,
             field='due',
-            block_type='Homework',
+            block_type='sequential',
             policy=existing_policy,
             assignment_title='Old Title',
             course_name=self.course_key.course,
@@ -814,7 +809,6 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
             title='Updated Assignment',
             date=self.due_date,
             block_key=self.block_key,
-            assignment_type='Homework',
             subsection_name='Updated Subsection',
         )
 
@@ -827,16 +821,17 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
         self.assertEqual(content_date.assignment_title, 'Updated Assignment')
         self.assertEqual(content_date.subsection_name, 'Updated Subsection')
         self.assertEqual(content_date.policy.abs_date, self.due_date)
+        # No duplicate ContentDate row created for the same (course, location, field).
+        self.assertEqual(models.ContentDate.objects.filter(location=self.block_key).count(), 1)
 
     def test_assignment_with_null_date(self):
         """
-        Test handling assignments with null dates.
+        Test handling assignments with null dates (no existing row).
         """
         null_date_assignment = Assignment(
             title='Null Date Assignment',
             date=None,
             block_key=self.block_key,
-            assignment_type='Homework',
         )
         api.update_or_create_assignments_due_dates(self.course_key, [null_date_assignment])
 
@@ -846,6 +841,32 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
         ).exists()
         self.assertFalse(content_date_exists)
 
+    def test_existing_row_with_null_date_is_left_unchanged(self):
+        """
+        A null-date assignment must not modify or remove an existing ContentDate row.
+        """
+        existing_policy = models.DatePolicy.objects.create(abs_date=self.due_date)
+        models.ContentDate.objects.create(
+            course_id=self.course_key,
+            location=self.block_key,
+            field='due',
+            block_type='sequential',
+            policy=existing_policy,
+            assignment_title='Keep Me',
+            course_name=self.course_key.course,
+        )
+        null_date_assignment = Assignment(
+            title='Null Date Assignment',
+            date=None,
+            block_key=self.block_key,
+        )
+
+        api.update_or_create_assignments_due_dates(self.course_key, [null_date_assignment])
+
+        content_date = models.ContentDate.objects.get(location=self.block_key)
+        self.assertEqual(content_date.assignment_title, 'Keep Me')
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+
     def test_assignment_with_missing_metadata(self):
         """
         Test handling assignments with missing metadata (no title).
@@ -854,7 +875,6 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
             title='',
             date=self.due_date,
             block_key=self.block_key,
-            assignment_type='Homework',
         )
         api.update_or_create_assignments_due_dates(self.course_key, [assignment])
 
@@ -872,7 +892,6 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
             title='Assignment 1',
             date=self.due_date,
             block_key=self.block_key,
-            assignment_type='Gradeable',
         )
 
         assignment2 = Assignment(
@@ -881,7 +900,6 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
             block_key=UsageKey.from_string(
                 'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test2'
             ),
-            assignment_type='Homework',
         )
         api.update_or_create_assignments_due_dates(self.course_key, [assignment1, assignment2])
         self.assertEqual(models.ContentDate.objects.count(), 2)
@@ -893,18 +911,48 @@ class TestUpdateAssignmentDatesForCourse(TestCase):
         api.update_or_create_assignments_due_dates(self.course_key, [])
         self.assertEqual(models.ContentDate.objects.count(), 0)
 
-    @patch('edx_when.models.DatePolicy.objects.get_or_create')
-    def test_date_policy_creation_exception(self, mock_policy_create):
+    def test_reuses_existing_date_policy_no_duplicates(self):
         """
-        Test handling exception during DatePolicy creation.
-        """
-        assignment = Assignment(
-            title='Test Assignment',
-            date=self.due_date,
-            block_key=self.block_key,
-            assignment_type='problem',
-        )
-        mock_policy_create.side_effect = Exception('Database Error')
+        Existing DatePolicy rows with matching values are reused, never duplicated.
 
-        with self.assertRaises(Exception):
-            api.update_or_create_assignments_due_dates(self.course_key, [assignment])
+        Simulates DatePolicy rows left over from a prior race and asserts the function
+        reuses one of them instead of creating another (regression for the get_or_create race).
+        """
+        models.DatePolicy.objects.create(abs_date=self.due_date)
+        models.DatePolicy.objects.create(abs_date=self.due_date)
+
+        api.update_or_create_assignments_due_dates(self.course_key, self.assignments)
+
+        # No third DatePolicy created; the existing (lowest-id) one is reused.
+        self.assertEqual(models.DatePolicy.objects.filter(abs_date=self.due_date).count(), 2)
+        content_date = models.ContentDate.objects.get(location=self.block_key)
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+
+    def test_atomic_rollback_on_failure(self):
+        """
+        A failure mid-loop rolls back the whole batch (single transaction boundary).
+        """
+        second_date = datetime(2025, 1, 15)
+        assignment1 = self.assignments[0]
+        assignment2 = Assignment(
+            title='Assignment 2',
+            date=second_date,
+            block_key=UsageKey.from_string(
+                'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test2'
+            ),
+        )
+
+        def fake_set_policy(date_kwargs, content_date):
+            if date_kwargs.get('abs_date') == second_date:
+                raise RuntimeError('boom')
+            content_date.policy = models.DatePolicy.objects.create(**date_kwargs)
+
+        with patch('edx_when.api._set_content_date_policy', side_effect=fake_set_policy):
+            with self.assertRaises(RuntimeError):
+                api.update_or_create_assignments_due_dates(
+                    self.course_key, [assignment1, assignment2]
+                )
+
+        # First assignment's write must have been rolled back.
+        self.assertEqual(models.ContentDate.objects.count(), 0)
+        self.assertEqual(models.DatePolicy.objects.count(), 0)

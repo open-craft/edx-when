@@ -8,7 +8,7 @@ from unittest.mock import Mock, call, patch
 
 import ddt
 from django.contrib import auth
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from edx_django_utils.cache.utils import RequestCache, TieredCache
 from opaque_keys.edx.keys import CourseKey, UsageKey
@@ -956,3 +956,40 @@ class TestUpdateOrCreateAssignmentsDueDates(TestCase):
         # First assignment's write must have been rolled back.
         self.assertEqual(models.ContentDate.objects.count(), 0)
         self.assertEqual(models.DatePolicy.objects.count(), 0)
+
+
+class TestAssignmentValidation(SimpleTestCase):
+    """
+    Tests for the Assignment dataclass __post_init__ validation.
+    """
+
+    block_key = UsageKey.from_string(
+        'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test1'
+    )
+
+    def test_accepts_datetime_and_none_date(self):
+        """
+        Both a datetime and None are valid dates.
+        """
+        due_date = datetime(2024, 12, 31, 23, 59, 59)
+
+        self.assertEqual(Assignment(title='T', date=due_date, block_key=self.block_key).date, due_date)
+        self.assertIsNone(Assignment(title='T', date=None, block_key=self.block_key).date)
+
+    def test_rejects_non_datetime_date(self):
+        """
+        A date that is neither a datetime nor None raises TypeError.
+        """
+        with self.assertRaises(TypeError) as ctx:
+            Assignment(title='T', date='2024-12-31', block_key=self.block_key)
+
+        self.assertEqual(str(ctx.exception), 'date must be a datetime object or None')
+
+    def test_rejects_non_usage_key_block_key(self):
+        """
+        A block_key that is not a UsageKey raises TypeError, even when serialized.
+        """
+        with self.assertRaises(TypeError) as ctx:
+            Assignment(title='T', date=None, block_key=str(self.block_key))
+
+        self.assertEqual(str(ctx.exception), 'block_key must be a UsageKey object')

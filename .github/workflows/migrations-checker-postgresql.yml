@@ -57,7 +57,11 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install -r requirements/ci.txt
-          pip install -r requirements/test.txt
+          # We need the -c here explicitly because we drop the django version from test.txt so that
+          # tox can manage it. Since, tox is not installing dependencies here,
+          # we need a way to manage the django and drf version for
+          # compatibility.
+          pip install -c requirements/constraints.txt -r requirements/test.txt
           pip install mysqlclient
           pip install psycopg2-binary
       - name: Apply Postgresql Migrations

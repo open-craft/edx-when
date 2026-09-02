@@ -8,12 +8,14 @@ from unittest.mock import Mock, call, patch
 
 import ddt
 from django.contrib import auth
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from edx_django_utils.cache.utils import RequestCache, TieredCache
+from opaque_keys.edx.keys import CourseKey, UsageKey
 from opaque_keys.edx.locator import CourseLocator
 
 from edx_when import api, models
+from edx_when.api import Assignment
 from test_utils import make_block_id, make_items
 from tests.test_models_app.models import DummyCourse, DummyEnrollment, DummySchedule
 
@@ -747,3 +749,247 @@ class ApiWaffleTests(TestCase):
     @patch.dict(sys.modules, {'openedx.features.course_experience': None})
     def test_relative_dates_import_error(self):
         assert not api._are_relative_dates_enabled()  # pylint: disable=protected-access
+
+
+class TestUpdateOrCreateAssignmentsDueDates(TestCase):
+    """
+    Tests for the update_or_create_assignments_due_dates API function.
+    """
+
+    def setUp(self):
+        self.course_key = CourseKey.from_string('course-v1:edX+DemoX+Demo_Course')
+        self.block_key = UsageKey.from_string(
+            'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test1'
+        )
+        self.due_date = datetime(2024, 12, 31, 23, 59, 59)
+        self.assignments = [
+            Assignment(
+                title='Test Assignment',
+                date=self.due_date,
+                block_key=self.block_key,
+                subsection_name='Test Subsection',
+            )
+        ]
+
+    def test_update_assignment_dates_new_records(self):
+        """
+        Test inserting new records when missing.
+        """
+        api.update_or_create_assignments_due_dates(self.course_key, self.assignments)
+
+        content_date = models.ContentDate.objects.get(
+            course_id=self.course_key,
+            location=self.block_key
+        )
+        self.assertEqual(content_date.assignment_title, 'Test Assignment')
+        self.assertEqual(content_date.subsection_name, 'Test Subsection')
+        # block_type stores the structural XBlock type, taken from block_key.
+        self.assertEqual(content_date.block_type, 'sequential')
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+        self.assertTrue(content_date.active)
+
+    def test_update_assignment_dates_existing_records(self):
+        """
+        Test updating existing records when values differ.
+        """
+        existing_policy = models.DatePolicy.objects.create(
+            abs_date=datetime(2024, 6, 1)
+        )
+        models.ContentDate.objects.create(
+            course_id=self.course_key,
+            location=self.block_key,
+            field='due',
+            block_type='sequential',
+            policy=existing_policy,
+            assignment_title='Old Title',
+            course_name=self.course_key.course,
+            subsection_name='Old Title'
+        )
+        new_assignment = Assignment(
+            title='Updated Assignment',
+            date=self.due_date,
+            block_key=self.block_key,
+            subsection_name='Updated Subsection',
+        )
+
+        api.update_or_create_assignments_due_dates(self.course_key, [new_assignment])
+
+        content_date = models.ContentDate.objects.get(
+            course_id=self.course_key,
+            location=self.block_key
+        )
+        self.assertEqual(content_date.assignment_title, 'Updated Assignment')
+        self.assertEqual(content_date.subsection_name, 'Updated Subsection')
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+        # No duplicate ContentDate row created for the same (course, location, field).
+        self.assertEqual(models.ContentDate.objects.filter(location=self.block_key).count(), 1)
+
+    def test_assignment_with_null_date(self):
+        """
+        Test handling assignments with null dates (no existing row).
+        """
+        null_date_assignment = Assignment(
+            title='Null Date Assignment',
+            date=None,
+            block_key=self.block_key,
+        )
+        api.update_or_create_assignments_due_dates(self.course_key, [null_date_assignment])
+
+        content_date_exists = models.ContentDate.objects.filter(
+            course_id=self.course_key,
+            location=self.block_key
+        ).exists()
+        self.assertFalse(content_date_exists)
+
+    def test_existing_row_with_null_date_is_left_unchanged(self):
+        """
+        A null-date assignment must not modify or remove an existing ContentDate row.
+        """
+        existing_policy = models.DatePolicy.objects.create(abs_date=self.due_date)
+        models.ContentDate.objects.create(
+            course_id=self.course_key,
+            location=self.block_key,
+            field='due',
+            block_type='sequential',
+            policy=existing_policy,
+            assignment_title='Keep Me',
+            course_name=self.course_key.course,
+        )
+        null_date_assignment = Assignment(
+            title='Null Date Assignment',
+            date=None,
+            block_key=self.block_key,
+        )
+
+        api.update_or_create_assignments_due_dates(self.course_key, [null_date_assignment])
+
+        content_date = models.ContentDate.objects.get(location=self.block_key)
+        self.assertEqual(content_date.assignment_title, 'Keep Me')
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+
+    def test_assignment_with_missing_metadata(self):
+        """
+        Test handling assignments with missing metadata (no title).
+        """
+        assignment = Assignment(
+            title='',
+            date=self.due_date,
+            block_key=self.block_key,
+        )
+        api.update_or_create_assignments_due_dates(self.course_key, [assignment])
+
+        content_date_exists = models.ContentDate.objects.filter(
+            course_id=self.course_key,
+            location=self.block_key
+        ).exists()
+        self.assertFalse(content_date_exists)
+
+    def test_multiple_assignments(self):
+        """
+        Test processing multiple assignments.
+        """
+        assignment1 = Assignment(
+            title='Assignment 1',
+            date=self.due_date,
+            block_key=self.block_key,
+        )
+
+        assignment2 = Assignment(
+            title='Assignment 2',
+            date=datetime(2025, 1, 15),
+            block_key=UsageKey.from_string(
+                'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test2'
+            ),
+        )
+        api.update_or_create_assignments_due_dates(self.course_key, [assignment1, assignment2])
+        self.assertEqual(models.ContentDate.objects.count(), 2)
+
+    def test_empty_assignments_list(self):
+        """
+        Test handling empty assignments list.
+        """
+        api.update_or_create_assignments_due_dates(self.course_key, [])
+        self.assertEqual(models.ContentDate.objects.count(), 0)
+
+    def test_reuses_existing_date_policy_no_duplicates(self):
+        """
+        Existing DatePolicy rows with matching values are reused, never duplicated.
+
+        Simulates DatePolicy rows left over from a prior race and asserts the function
+        reuses one of them instead of creating another (regression for the get_or_create race).
+        """
+        models.DatePolicy.objects.create(abs_date=self.due_date)
+        models.DatePolicy.objects.create(abs_date=self.due_date)
+
+        api.update_or_create_assignments_due_dates(self.course_key, self.assignments)
+
+        # No third DatePolicy created; the existing (lowest-id) one is reused.
+        self.assertEqual(models.DatePolicy.objects.filter(abs_date=self.due_date).count(), 2)
+        content_date = models.ContentDate.objects.get(location=self.block_key)
+        self.assertEqual(content_date.policy.abs_date, self.due_date)
+
+    def test_atomic_rollback_on_failure(self):
+        """
+        A failure mid-loop rolls back the whole batch (single transaction boundary).
+        """
+        second_date = datetime(2025, 1, 15)
+        assignment1 = self.assignments[0]
+        assignment2 = Assignment(
+            title='Assignment 2',
+            date=second_date,
+            block_key=UsageKey.from_string(
+                'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test2'
+            ),
+        )
+
+        def fake_set_policy(date_kwargs, content_date):
+            if date_kwargs.get('abs_date') == second_date:
+                raise RuntimeError('boom')
+            content_date.policy = models.DatePolicy.objects.create(**date_kwargs)
+
+        with patch('edx_when.api._set_content_date_policy', side_effect=fake_set_policy):
+            with self.assertRaises(RuntimeError):
+                api.update_or_create_assignments_due_dates(
+                    self.course_key, [assignment1, assignment2]
+                )
+
+        # First assignment's write must have been rolled back.
+        self.assertEqual(models.ContentDate.objects.count(), 0)
+        self.assertEqual(models.DatePolicy.objects.count(), 0)
+
+
+class TestAssignmentValidation(SimpleTestCase):
+    """
+    Tests for the Assignment dataclass __post_init__ validation.
+    """
+
+    block_key = UsageKey.from_string(
+        'block-v1:edX+DemoX+Demo_Course+type@sequential+block@test1'
+    )
+
+    def test_accepts_datetime_and_none_date(self):
+        """
+        Both a datetime and None are valid dates.
+        """
+        due_date = datetime(2024, 12, 31, 23, 59, 59)
+
+        self.assertEqual(Assignment(title='T', date=due_date, block_key=self.block_key).date, due_date)
+        self.assertIsNone(Assignment(title='T', date=None, block_key=self.block_key).date)
+
+    def test_rejects_non_datetime_date(self):
+        """
+        A date that is neither a datetime nor None raises TypeError.
+        """
+        with self.assertRaises(TypeError) as ctx:
+            Assignment(title='T', date='2024-12-31', block_key=self.block_key)
+
+        self.assertEqual(str(ctx.exception), 'date must be a datetime object or None')
+
+    def test_rejects_non_usage_key_block_key(self):
+        """
+        A block_key that is not a UsageKey raises TypeError, even when serialized.
+        """
+        with self.assertRaises(TypeError) as ctx:
+            Assignment(title='T', date=None, block_key=str(self.block_key))
+
+        self.assertEqual(str(ctx.exception), 'block_key must be a UsageKey object')

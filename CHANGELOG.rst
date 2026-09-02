@@ -13,6 +13,15 @@ Change Log
 
 Unreleased
 ~~~~~~~~~~
+
+[4.1.0] - 2026-08-13
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* Add ``update_or_create_assignments_due_dates`` API to bulk upsert assignment due dates
+  into ``ContentDate`` inside a single transaction.
+* Add the ``Assignment`` dataclass used as the input type of that API.
+* Extract ``_set_content_date_policy`` out of ``set_date_for_block`` so both write paths
+  reuse an existing ``DatePolicy`` instead of creating duplicates.
+
 [3.2.1] - 2026-02-20
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 * Add distinct query by block and user in get_overrides_for_course to prevent duplicate overrides when a user has multiple overrides for the same block.

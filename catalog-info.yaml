@@ -7,6 +7,6 @@ metadata:
   name: 'edx-when'
   description: "This repo contains start, end, and due dates for Courses and offers the functionality to have both absolute and relative dates."
 spec:
-  owner: group:openedx-unmaintained
+  owner: user:farhaanbukhsh
   type: 'library'
   lifecycle: ''
